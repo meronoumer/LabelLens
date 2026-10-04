@@ -1,0 +1,39 @@
+[
+  {
+    "product_id": "product_001",
+    "name": "Example Protein Bar",
+    "brand": "FitFuel",
+    "barcode": "0123456789012",
+    "ingredients_available": true,
+    "ingredients": [
+      "soy protein isolate",
+      "whey protein concentrate",
+      "cocoa",
+      "almonds"
+    ],
+    "allergen_statement": "Contains: Milk, Soy, Tree Nuts"
+  },
+  {
+    "product_id": "product_002",
+    "name": "Example Fruit Snack",
+    "brand": "NatureBite",
+    "barcode": "0987654321098",
+    "ingredients_available": true,
+    "ingredients": [
+      "apple puree",
+      "sugar",
+      "citric acid",
+      "pectin"
+    ],
+    "allergen_statement": "Contains: none of the major allergens"
+  },
+  {
+    "product_id": "product_003",
+    "name": "Example Imported Snack",
+    "brand": "Unknown",
+    "barcode": null,
+    "ingredients_available": false,
+    "ingredients": [],
+    "allergen_statement": null
+  }
+]
