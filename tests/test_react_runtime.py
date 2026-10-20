@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from labellens.agent.llm_client import MockLLMClient
 from labellens.agent.react_actor import ReActActor
 from labellens.agent.react_runtime import ReActRuntime, default_tools
@@ -70,13 +72,12 @@ def test_actor_chooses_abstain(tmp_path):
 
 
 def test_invalid_tool_name_terminates_with_error(tmp_path):
-    # get_certification_evidence is a real tool class elsewhere in the
-    # codebase, but it is deliberately not in this runtime's registry —
-    # selecting it must fail validation, not silently run it.
+    # "get_price_evidence" names no tool that has ever existed in this
+    # codebase — selecting it must fail validation, not silently run it.
     script = [
         {
-            "decision_summary": "trying a disallowed tool",
-            "action": "get_certification_evidence",
+            "decision_summary": "trying a nonexistent tool",
+            "action": "get_price_evidence",
             "arguments": {"product_id": "product_001"},
         }
     ]
@@ -256,3 +257,246 @@ def test_end_to_end_abstention_fixture_run(tmp_path):
     assert state.evidence_collected == []
     assert state.final_answer == "Ingredient and allergen information could not be retrieved."
     assert saved_path.exists()
+
+
+# -- v0.2: certification / recall tool routing -------------------------------
+
+
+def test_actor_selects_get_certification_evidence(tmp_path):
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_001"}},
+        {
+            "decision_summary": "need certification evidence",
+            "action": "get_certification_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {"decision_summary": "sufficient", "action": "finish", "arguments": {"answer": "Yes, kosher certified."}},
+    ]
+    state, trajectory, saved_path = make_runtime(script).run("Is this kosher?", output_dir=tmp_path)
+
+    assert "get_certification_evidence" in state.tools_called
+    assert any(e.claim_type == "certification" for e in state.evidence_collected)
+    assert any(e.status == "FOUND" for e in state.evidence_collected)
+
+
+def test_actor_selects_get_recall_evidence(tmp_path):
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_002"}},
+        {
+            "decision_summary": "need recall evidence",
+            "action": "get_recall_evidence",
+            "arguments": {"product_id": "product_002"},
+        },
+        {"decision_summary": "sufficient", "action": "finish", "arguments": {"answer": "Yes, there is a recall."}},
+    ]
+    state, trajectory, saved_path = make_runtime(script).run("Has this been recalled?", output_dir=tmp_path)
+
+    assert "get_recall_evidence" in state.tools_called
+    recall_evidence = [e for e in state.evidence_collected if e.claim_type == "recall"]
+    assert len(recall_evidence) == 1
+    assert recall_evidence[0].status == "FOUND"
+
+
+def test_certification_and_recall_tool_failures_are_recoverable_like_ingredient_failures(tmp_path):
+    class FailingCertTool(Tool):
+        name = "get_certification_evidence"
+        description = "A test double that always raises during execute()."
+
+        def execute(self, product_id: str) -> ToolResult:
+            raise RuntimeError("certification backend unreachable")
+
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_001"}},
+        {
+            "decision_summary": "need certification evidence",
+            "action": "get_certification_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {"decision_summary": "give up", "action": "abstain", "arguments": {"reason": "certification tool failed"}},
+    ]
+    tools = default_tools()
+    tools["get_certification_evidence"] = FailingCertTool()
+    state, trajectory, saved_path = make_runtime(script, tools=tools).run("Is this kosher?", output_dir=tmp_path)
+
+    assert state.status == RunStatus.ABSTAINED
+    failed_observation = state.observations[-1]
+    assert failed_observation["success"] is False
+    assert "certification backend unreachable" in failed_observation["summary"]
+
+
+# -- v0.2: compound queries requiring more than one evidence tool ------------
+
+
+def test_compound_query_collects_both_ingredient_and_certification_evidence(tmp_path):
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_001"}},
+        {
+            "decision_summary": "need ingredient evidence for dairy-free",
+            "action": "get_ingredient_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {
+            "decision_summary": "need certification evidence for kosher",
+            "action": "get_certification_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {
+            "decision_summary": "both evidence types collected; sufficient to answer",
+            "action": "finish",
+            "arguments": {"answer": "Not dairy-free (contains whey), but is kosher certified."},
+        },
+    ]
+    state, trajectory, saved_path = make_runtime(script).run(
+        "Is this dairy-free and kosher?", output_dir=tmp_path
+    )
+
+    assert state.status == RunStatus.ANSWERED
+    claim_types = {e.claim_type for e in state.evidence_collected}
+    assert "ingredient" in claim_types or "allergen" in claim_types
+    assert "certification" in claim_types
+    assert trajectory.tools_used == ["identify_product", "get_ingredient_evidence", "get_certification_evidence"]
+    # order is whatever the Actor chose -- the runtime didn't dictate it
+    tool_call_steps = [s.tool_name for s in trajectory.steps if s.tool_name]
+    assert tool_call_steps == ["identify_product", "get_ingredient_evidence", "get_certification_evidence"]
+
+
+def test_missing_certification_leads_to_abstention_not_a_guess(tmp_path):
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_003"}},
+        {
+            "decision_summary": "need certification evidence",
+            "action": "get_certification_evidence",
+            "arguments": {"product_id": "product_003"},
+        },
+        {
+            "decision_summary": "certification status is unknown; cannot confirm or deny",
+            "action": "abstain",
+            "arguments": {"reason": "Certification records are unavailable for this product."},
+        },
+    ]
+    state, trajectory, saved_path = make_runtime(script).run("Is this kosher?", output_dir=tmp_path)
+
+    assert state.status == RunStatus.ABSTAINED
+    assert len(state.evidence_collected) == 1
+    assert state.evidence_collected[0].status == "UNKNOWN"
+    assert "Certification records are unavailable for this product." in state.missing_evidence
+
+
+def test_missing_product_case_actor_abstains_rather_than_guessing(tmp_path):
+    script = [
+        {
+            "decision_summary": "identify first",
+            "action": "identify_product",
+            "arguments": {"query": "no-such-product-xyz"},
+        },
+        {
+            "decision_summary": "product could not be identified; cannot proceed",
+            "action": "abstain",
+            "arguments": {"reason": "Could not identify a product matching the query."},
+        },
+    ]
+    state, trajectory, saved_path = make_runtime(script).run(QUERY, output_dir=tmp_path)
+
+    assert state.status == RunStatus.ABSTAINED
+    assert state.resolved_product is None
+    assert state.evidence_collected == []
+
+
+def test_evidence_tool_can_be_called_without_a_prior_identify_product(tmp_path):
+    # Intentional: the runtime does not gate evidence tools on product
+    # identity being resolved first. The Actor decides that ordering; an
+    # out-of-order call just gets whatever the tool returns for that id.
+    script = [
+        {
+            "decision_summary": "jumping straight to ingredient evidence",
+            "action": "get_ingredient_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {"decision_summary": "sufficient", "action": "finish", "arguments": {"answer": "ok"}},
+    ]
+    state, trajectory, saved_path = make_runtime(script).run(QUERY, output_dir=tmp_path)
+
+    assert state.status == RunStatus.ANSWERED
+    assert state.resolved_product is None  # identify_product was never called
+    assert len(state.evidence_collected) > 0  # the tool still ran against the given product_id
+
+
+# -- v0.2: repeated calls are allowed and logged, not silently collapsed -----
+
+
+def test_repeated_identical_tool_call_is_logged_and_not_deduplicated(tmp_path):
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_001"}},
+        {
+            "decision_summary": "need ingredient evidence",
+            "action": "get_ingredient_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {
+            "decision_summary": "double-checking ingredient evidence",
+            "action": "get_ingredient_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {"decision_summary": "sufficient", "action": "finish", "arguments": {"answer": "ok"}},
+    ]
+    state, trajectory, saved_path = make_runtime(script).run(QUERY, output_dir=tmp_path)
+
+    ingredient_calls = [s for s in trajectory.steps if s.tool_name == "get_ingredient_evidence"]
+    assert len(ingredient_calls) == 2  # both calls preserved, not collapsed into one
+    assert state.tools_called.count("get_ingredient_evidence") == 2
+    assert state.observations[2].get("repeated_call") is True
+    assert "repeated" in ingredient_calls[1].action
+    # duplicate evidence is preserved too, with distinct ids
+    ingredient_evidence_ids = [e.evidence_id for e in state.evidence_collected]
+    assert len(ingredient_evidence_ids) == len(set(ingredient_evidence_ids))  # all unique ids
+    assert len(state.evidence_collected) == 10  # 5 items x 2 identical calls
+
+
+# -- v0.2: structured provenance survives into AgentState/Trajectory --------
+
+
+def test_provenance_fields_are_preserved_for_every_evidence_type(tmp_path):
+    script = [
+        {"decision_summary": "identify first", "action": "identify_product", "arguments": {"query": "product_001"}},
+        {
+            "decision_summary": "ingredient evidence",
+            "action": "get_ingredient_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {
+            "decision_summary": "certification evidence",
+            "action": "get_certification_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {
+            "decision_summary": "recall evidence",
+            "action": "get_recall_evidence",
+            "arguments": {"product_id": "product_001"},
+        },
+        {"decision_summary": "sufficient", "action": "finish", "arguments": {"answer": "ok"}},
+    ]
+    state, trajectory, saved_path = make_runtime(script).run(QUERY, output_dir=tmp_path)
+
+    assert {e.claim_type for e in state.evidence_collected} == {"ingredient", "allergen", "certification", "recall"}
+    for evidence in state.evidence_collected:
+        assert evidence.source_name == "fixture_product_database"
+        assert evidence.source_type == "product_database"
+        assert evidence.source_reference
+        assert evidence.tool_name in {"get_ingredient_evidence", "get_certification_evidence", "get_recall_evidence"}
+        assert evidence.retrieved_at is not None
+
+
+# -- v0.2: one canonical run_id for AgentState and Trajectory ----------------
+
+
+def test_agent_state_and_trajectory_share_one_canonical_run_id(tmp_path):
+    script = [{"decision_summary": "sufficient", "action": "finish", "arguments": {"answer": "ok"}}]
+    state, trajectory, saved_path = make_runtime(script).run(QUERY, output_dir=tmp_path)
+
+    assert state.run_id == trajectory.run_id
+    assert state.run_id.startswith("run_")
+
+    saved = json.loads(saved_path.read_text())
+    assert saved["run_id"] == state.run_id
+    # the state snapshots embedded in each step must also reflect the same id
+    assert saved["steps"][0]["state_after"]["run_id"] == state.run_id

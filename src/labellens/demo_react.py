@@ -1,47 +1,40 @@
-"""Run LabelLens v0.1's ReAct-style Actor loop against three scripted scenarios.
+"""Run LabelLens v0.2's ReAct-style Actor loop against six scripted scenarios.
 
     python -m labellens.demo_react
 
-Uses a MockLLMClient by default — no API key, no network call, no cost.
-If LABELLENS_LLM_API_URL (and the matching API key / model env vars) are
-set, this switches to the real HTTPLLMClient instead, so the same control
-loop can be inspected against a real model once one is configured.
+Always uses a MockLLMClient — no API key, no network call, no cost. Each
+scenario is a fixed script standing in for what a real model would have
+decided at each turn; the runtime, tools, evidence, and trajectory
+logging underneath are the real, unmodified v0.2 code. See
+demo_react_live.py to run an arbitrary query through the real OpenAI
+Actor instead.
 """
 
 from __future__ import annotations
 
-import os
-
-from labellens.agent.llm_client import HTTPLLMClient, LLMClient, MockLLMClient
+from labellens.agent.llm_client import MockLLMClient
 from labellens.agent.react_actor import ReActActor
 from labellens.agent.react_runtime import ReActRuntime
 from labellens.trajectory.models import Trajectory
 
-QUERY_TEMPLATE = "Does {product} contain milk?"
-
-# Each script is a fixed sequence of raw decision dicts, standing in for
-# what a real model would have returned at each turn. These mirror the
-# three v0 fixture outcomes: clear evidence, no evidence found, and
-# evidence unavailable.
-SCENARIOS: list[tuple[str, str]] = [
-    ("product_001", "clear milk evidence -> finish"),
-    ("product_002", "no milk evidence -> finish (hedged)"),
-    ("product_003", "no ingredient data -> abstain"),
-]
-
-
-def build_mock_client(product_id: str) -> MockLLMClient:
-    if product_id == "product_001":
-        script = [
+# Each scenario: (query, label, script). The "action" sequence a real
+# model would choose might differ (e.g. evidence tool order for the
+# compound question) -- the runtime never enforces an order, only these
+# demo scripts happen to pick one reasonable path.
+SCENARIOS: list[tuple[str, str, list[dict]]] = [
+    (
+        "Does Example Protein Bar contain milk?",
+        "1. allergen question -> finish (milk found)",
+        [
             {
                 "decision_summary": "Need to identify the product before anything else.",
                 "action": "identify_product",
-                "arguments": {"query": product_id},
+                "arguments": {"query": "product_001"},
             },
             {
                 "decision_summary": "Need ingredient evidence before answering.",
                 "action": "get_ingredient_evidence",
-                "arguments": {"product_id": product_id},
+                "arguments": {"product_id": "product_001"},
             },
             {
                 "decision_summary": "Ingredient evidence shows a milk-derived ingredient; evidence is sufficient.",
@@ -50,54 +43,118 @@ def build_mock_client(product_id: str) -> MockLLMClient:
                     "answer": "Yes, evidence of a milk-derived ingredient was found: 'whey protein concentrate'."
                 },
             },
-        ]
-    elif product_id == "product_002":
-        script = [
+        ],
+    ),
+    (
+        "Is Example Protein Bar kosher?",
+        "2. certification question -> finish (kosher found)",
+        [
             {
                 "decision_summary": "Need to identify the product before anything else.",
                 "action": "identify_product",
-                "arguments": {"query": product_id},
+                "arguments": {"query": "product_001"},
             },
             {
-                "decision_summary": "Need ingredient evidence before answering.",
-                "action": "get_ingredient_evidence",
-                "arguments": {"product_id": product_id},
+                "decision_summary": "Need certification evidence before answering.",
+                "action": "get_certification_evidence",
+                "arguments": {"product_id": "product_001"},
             },
             {
-                "decision_summary": "No milk-derived ingredients found; answering with available evidence.",
+                "decision_summary": "Certification evidence confirms kosher status; evidence is sufficient.",
+                "action": "finish",
+                "arguments": {"answer": "Yes, certified kosher by Example Kosher Council."},
+            },
+        ],
+    ),
+    (
+        "Has Example Fruit Snack been recalled?",
+        "3. recall question -> finish (recall found)",
+        [
+            {
+                "decision_summary": "Need to identify the product before anything else.",
+                "action": "identify_product",
+                "arguments": {"query": "product_002"},
+            },
+            {
+                "decision_summary": "Need recall evidence before answering.",
+                "action": "get_recall_evidence",
+                "arguments": {"product_id": "product_002"},
+            },
+            {
+                "decision_summary": "A matching recall was found; evidence is sufficient.",
                 "action": "finish",
                 "arguments": {
-                    "answer": "Based on the available evidence, no milk-derived ingredients were found. "
-                    "This is not a guarantee the product is free of milk."
+                    "answer": "Yes, recall RECALL-2022-0099 (undeclared tree nut traces, 2022-11-03) applies."
                 },
             },
-        ]
-    else:
-        script = [
+        ],
+    ),
+    (
+        "Is Example Protein Bar dairy-free and kosher?",
+        "4. compound question -> two evidence tools -> finish",
+        [
             {
                 "decision_summary": "Need to identify the product before anything else.",
                 "action": "identify_product",
-                "arguments": {"query": product_id},
+                "arguments": {"query": "product_001"},
             },
             {
-                "decision_summary": "Need ingredient evidence before answering.",
+                "decision_summary": "Need ingredient evidence to assess dairy-free.",
                 "action": "get_ingredient_evidence",
-                "arguments": {"product_id": product_id},
+                "arguments": {"product_id": "product_001"},
             },
             {
-                "decision_summary": "Required evidence is unavailable.",
-                "action": "abstain",
-                "arguments": {"reason": "Ingredient and allergen information could not be retrieved."},
+                "decision_summary": "Need certification evidence to assess kosher status.",
+                "action": "get_certification_evidence",
+                "arguments": {"product_id": "product_001"},
             },
-        ]
-    return MockLLMClient(script)
-
-
-def build_llm_client(product_id: str) -> LLMClient:
-    required_env = ("LABELLENS_LLM_API_URL", "LABELLENS_LLM_API_KEY", "LABELLENS_LLM_MODEL")
-    if all(os.environ.get(var) for var in required_env):
-        return HTTPLLMClient()
-    return build_mock_client(product_id)
+            {
+                "decision_summary": "Both evidence types collected; sufficient to answer the compound question.",
+                "action": "finish",
+                "arguments": {
+                    "answer": "Not dairy-free (contains whey protein concentrate), but is certified kosher."
+                },
+            },
+        ],
+    ),
+    (
+        "Is Example Imported Snack kosher?",
+        "5. missing-certification case -> abstain",
+        [
+            {
+                "decision_summary": "Need to identify the product before anything else.",
+                "action": "identify_product",
+                "arguments": {"query": "product_003"},
+            },
+            {
+                "decision_summary": "Need certification evidence before answering.",
+                "action": "get_certification_evidence",
+                "arguments": {"product_id": "product_003"},
+            },
+            {
+                "decision_summary": "Certification status is unknown and cannot be confirmed; abstaining.",
+                "action": "abstain",
+                "arguments": {"reason": "Certification records are unavailable for this product."},
+            },
+        ],
+    ),
+    (
+        "Does the Acme Mystery Snack contain peanuts?",
+        "6. unknown product case -> abstain",
+        [
+            {
+                "decision_summary": "Need to identify the product before anything else.",
+                "action": "identify_product",
+                "arguments": {"query": "Acme Mystery Snack"},
+            },
+            {
+                "decision_summary": "Product could not be identified; cannot proceed to evidence retrieval.",
+                "action": "abstain",
+                "arguments": {"reason": "Could not identify a product matching 'Acme Mystery Snack'."},
+            },
+        ],
+    ),
+]
 
 
 def print_trajectory(trajectory: Trajectory) -> None:
@@ -119,10 +176,8 @@ def print_trajectory(trajectory: Trajectory) -> None:
             print(f"  Observation: {step.action}")
 
 
-def run_scenario(product_id: str, label: str) -> None:
-    query = QUERY_TEMPLATE.format(product=product_id)
-    llm_client = build_llm_client(product_id)
-    actor = ReActActor(llm_client)
+def run_scenario(query: str, label: str, script: list[dict]) -> None:
+    actor = ReActActor(MockLLMClient(script))
     runtime = ReActRuntime(actor)
 
     print("QUERY")
@@ -137,8 +192,8 @@ def run_scenario(product_id: str, label: str) -> None:
 
 
 def main() -> None:
-    for product_id, label in SCENARIOS:
-        run_scenario(product_id, label)
+    for query, label, script in SCENARIOS:
+        run_scenario(query, label, script)
 
 
 if __name__ == "__main__":

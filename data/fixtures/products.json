@@ -11,7 +11,18 @@
       "cocoa",
       "almonds"
     ],
-    "allergen_statement": "Contains: Milk, Soy, Tree Nuts"
+    "allergen_statement": "Contains: Milk, Soy, Tree Nuts",
+    "certifications_available": true,
+    "certifications": [
+      {
+        "type": "kosher",
+        "status": "FOUND",
+        "certifying_body": "Example Kosher Council",
+        "certificate_id": "EKC-2024-0098"
+      }
+    ],
+    "recalls_available": true,
+    "recalls": []
   },
   {
     "product_id": "product_002",
@@ -25,7 +36,23 @@
       "citric acid",
       "pectin"
     ],
-    "allergen_statement": "Contains: none of the major allergens"
+    "allergen_statement": "Contains: none of the major allergens",
+    "certifications_available": true,
+    "certifications": [
+      {
+        "type": "gluten_free",
+        "status": "NOT_FOUND"
+      }
+    ],
+    "recalls_available": true,
+    "recalls": [
+      {
+        "recall_id": "RECALL-2022-0099",
+        "reason": "undeclared tree nut traces",
+        "date": "2022-11-03",
+        "status": "active"
+      }
+    ]
   },
   {
     "product_id": "product_003",
@@ -34,6 +61,34 @@
     "barcode": null,
     "ingredients_available": false,
     "ingredients": [],
-    "allergen_statement": null
+    "allergen_statement": null,
+    "certifications_available": false,
+    "certifications": [],
+    "recalls_available": false,
+    "recalls": []
+  },
+  {
+    "product_id": "product_004",
+    "name": "Example Halal Snack Mix",
+    "brand": "Example Co",
+    "barcode": "0111222333444",
+    "ingredients_available": true,
+    "ingredients": [
+      "rice",
+      "dried fruit",
+      "sunflower oil"
+    ],
+    "allergen_statement": "Contains: none of the major allergens",
+    "certifications_available": true,
+    "certifications": [
+      {
+        "type": "halal",
+        "status": "FOUND",
+        "certifying_body": "Example Halal Board",
+        "certificate_id": "EHB-2021-0033"
+      }
+    ],
+    "recalls_available": true,
+    "recalls": []
   }
 ]

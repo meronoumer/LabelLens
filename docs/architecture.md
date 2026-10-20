@@ -2,10 +2,22 @@
 
 ## Scope of this document
 
-Covers v0 (deterministic baseline) and v0.1 (ReAct-style Actor). Neither
-version includes AvaTaR optimization, prompt optimization, a memory bank,
-embeddings, a vector database, certification/recall behavior, or a
+Covers v0 (deterministic baseline), v0.1 (ReAct-style Actor, two tools),
+and v0.2 (ReAct-style Actor, four tools — the current version). None of
+these include AvaTaR optimization, prompt optimization, a memory bank,
+embeddings, a vector database, a benchmark/experiment harness, or a
 frontend — those are explicitly future work.
+
+## Responsibility split
+
+| Layer | Responsibility |
+|---|---|
+| **Actor** (`agent/react_actor.py`) | Decides the next action. Never executes a tool, never touches fixture data. |
+| **Runtime** (`agent/react_runtime.py`) | Validates the Actor's decision, executes the chosen tool, builds the observation, updates state, logs the step, enforces the step limit. Never decides *which* tool a question needs. |
+| **Tools** (`tools/`) | Retrieve one kind of evidence from fixture data and return a uniform `ToolResult`. Dumb and complete — return everything on file, let the Actor judge relevance. |
+| **Evidence layer** (`evidence/`) | Stores each retrieved claim plus its provenance (`Evidence`), and can reconstruct a human-readable trace from claim back to raw source (`provenance.py`). |
+| **Agent state** (`agent/state.py`) | The mutable working memory for one run — what's been resolved, collected, and decided so far. |
+| **Trajectory logger** (`trajectory/`) | Records the full observable execution path (decisions, actions, arguments, tool results, evidence IDs, state snapshots) as one serializable, saved JSON record per run. |
 
 ## v0: deterministic baseline
 
@@ -59,10 +71,10 @@ a hard step limit, no silent repair of bad output).
 | Concern | File |
 |---|---|
 | Structured decision type, shape validation | `agent/decision.py` (`AgentDecision`, `parse_decision`, `ActorOutputError`) |
-| Model call abstraction | `agent/llm_client.py` (`LLMClient`, `MockLLMClient`, `HTTPLLMClient`) |
+| Model call abstraction | `agent/llm_client.py` (`LLMClient`, `MockLLMClient`, `OpenAILLMClient`) |
 | Deciding (no tool execution) | `agent/react_actor.py` (`ReActActor`, `TOOL_DESCRIPTIONS`) |
 | Validating, executing, observing, logging, terminating | `agent/react_runtime.py` (`ReActRuntime`) |
-| Demo | `demo_react.py` |
+| Demos | `demo_react.py` (mock, used by nothing paid), `demo_react_live.py` (real OpenAI Actor, manual only) |
 
 ### Why the Actor doesn't execute tools
 
@@ -90,7 +102,7 @@ subject or published in a paper without exposing private model internals.
    basic types? This is the same regardless of which tools exist, so it
    lives next to `AgentDecision` itself, not in the runtime.
 2. **Semantic validation** (`ReActRuntime._validate_decision`): is
-   `action` one of the four allowed actions, and are *that action's*
+   `action` one of the six allowed actions, and are *that action's*
    required arguments present? This depends on which tools this runtime
    actually registered, so it lives in the runtime.
 
@@ -112,6 +124,32 @@ These are deliberately different outcomes:
   the Actor on the next turn — exactly like a successful observation.
   The Actor (or a future Comparator) can see "this tool call failed" and
   decide what to do about it.
+
+### The real LLM client: OpenAILLMClient
+
+`OpenAILLMClient` implements the same `LLMClient` interface as
+`MockLLMClient` — `react_actor.py` and `react_runtime.py` don't know or
+care which one they're talking to. It calls the OpenAI **Responses API**
+(not the deprecated Assistants API) with structured-output enforcement
+(`text.format` set to a strict `json_schema`), so the model's reply is
+already shaped like `{"decision_summary", "action", "arguments"}` by
+construction. That response is still re-validated through the same
+`parse_decision()` the mock client uses — one validation path regardless
+of where the decision came from.
+
+Configuration is environment-only: `OPENAI_API_KEY` (required) and
+`LABELLENS_LLM_MODEL` (optional, defaults to `gpt-6-luna` — chosen as a
+low-cost model for development, since a ReAct run makes several Actor
+calls). Swapping to a stronger model for comparison later is a one-line
+environment change, not a code change.
+
+A model *refusal*, missing output text, or invalid/incomplete JSON all
+raise `ActorOutputError` — the same exception `MockLLMClient` raises for
+a malformed scripted entry — so `ReActRuntime` handles a bad real-model
+response exactly the way it already handles a bad mock response. Network,
+auth, and rate-limit failures from the OpenAI SDK are deliberately left
+to propagate uncaught, since those aren't "the Actor's output was
+malformed" — they're "the call didn't complete at all."
 
 ### The step limit
 
@@ -135,14 +173,84 @@ matches the evidence collected (final answer correctness / appropriate
 abstention). None of this requires re-running anything — it's all in the
 JSON file under `data/trajectories/`.
 
+## v0.2: multiple evidence tools, genuine tool-choice
+
+v0.1 had exactly two real tools, so "the Actor chooses" was true in
+principle but not very visible in practice — most questions had only one
+sensible path. v0.2 adds two more real evidence tools so different
+questions can actually produce different trajectories:
+
+**Available Actor actions** (6): `identify_product`, `get_ingredient_evidence`,
+`get_certification_evidence`, `get_recall_evidence`, `finish`, `abstain`.
+
+Nothing in `ReActRuntime` branches on the question text or on a question
+category to decide which evidence tool to call — there is no `if "kosher"
+in query: ...` anywhere. `ALLOWED_ACTIONS` (`agent/decision.py`) and
+`REQUIRED_ARGUMENTS`/`default_tools()` (`agent/react_runtime.py`) just
+register what's *available*; which of them actually gets used, in what
+order, how many times, is 100% the Actor's decision every single step.
+
+### FOUND / NOT_FOUND / UNKNOWN
+
+`get_certification_evidence` and `get_recall_evidence` never infer a
+negative from absence. Three outcomes, explicit every time:
+
+- **FOUND** — the record is on file (e.g. kosher, certifying body X).
+- **NOT_FOUND** — checked, nothing on file. (Recall: "no matching recall
+  in the dataset." Certification: a specific type checked and absent.)
+- **UNKNOWN** — the tool couldn't check at all (`certifications_available`
+  / `recalls_available` is `false` for that product, or the product
+  itself doesn't exist). This is never represented as an empty list,
+  because an empty list can't be told apart from "didn't check" — these
+  tools always return at least one `Evidence` item.
+
+This is the one new field on `Evidence`: `status: Optional[str]`, only
+meaningful for `claim_type ∈ {"certification", "recall"}`. Ingredient and
+allergen evidence leave it `None` — those are plain retrieved facts, not
+the result of a found/not-found/unknown lookup. No other model changed.
+
+### Evidence now carries content, not just a count
+
+v0.1's tool-call observation told the Actor "N evidence item(s)
+retrieved" with no indication of what they said — a real model could
+select the right tool but never actually read what it found. Fixed in
+`ReActRuntime._apply_evidence_tool_result`: the observation now includes
+`{"claim_type", "value", "status"}` for every item retrieved, for all
+three evidence tools (one shared method, since the result shape is
+identical across them).
+
+### Compound questions and repeated calls
+
+"Is this dairy-free and kosher?" needs two different evidence tools in
+one run — nothing stops the Actor from calling `get_ingredient_evidence`
+then `get_certification_evidence` (or the reverse order) before
+`finish`. Repeated identical calls aren't deduplicated or blocked either:
+if the Actor calls the same tool with the same arguments twice, both
+calls execute, both get logged as separate `TrajectoryStep`s (the second
+one's action string is suffixed `(repeated)` and its observation carries
+`"repeated_call": true`), and duplicate `Evidence` objects (fresh IDs
+each time) land in `state.evidence_collected`. This is deliberate —
+repeated/unnecessary tool use is exactly the kind of thing a future
+Comparator needs to see, not something the runtime should hide.
+
+### One canonical run_id
+
+`AgentState.run_id` and `Trajectory.run_id` used to be generated
+independently (two unrelated UUIDs for the same run). `ReActRuntime.run()`
+now generates one `run_id` up front and passes it to both — see
+`tests/test_react_runtime.py::test_agent_state_and_trajectory_share_one_canonical_run_id`.
+
 ## What's deliberately not built yet
 
 - No AvaTaR Comparator, no successful/unsuccessful trajectory batching,
   no prompt optimization, no contrastive optimization.
+- No experiment harness, no benchmark.
 - No memory bank, no embeddings, no vector database.
-- Certification and recall tools exist as placeholders
-  (`tools/certification.py`, `tools/recalls.py`) but are not in
-  `ReActRuntime`'s tool registry and cannot be selected by the Actor.
-- No UI, no LangChain/LangGraph, no multi-agent framework.
+- No cross-evidence conflict *detection* (e.g. ingredients implying
+  non-kosher while a certification record says "kosher: FOUND"). The
+  `AgentState.conflicts` field exists and is serialized, but nothing
+  populates it yet — a natural v0.3 candidate.
+- No UI, no LangChain/LangGraph, no multi-agent framework, no live
+  external data sources (fixtures only).
 - `EvaluationResult` is defined (`evaluation/models.py`) but nothing
-  populates it automatically in either v0 or v0.1.
+  populates it automatically in any version.

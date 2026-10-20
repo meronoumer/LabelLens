@@ -11,7 +11,14 @@ from dataclasses import dataclass, field
 
 from labellens.serialization import Serializable
 
-ALLOWED_ACTIONS = {"identify_product", "get_ingredient_evidence", "finish", "abstain"}
+ALLOWED_ACTIONS = {
+    "identify_product",
+    "get_ingredient_evidence",
+    "get_certification_evidence",
+    "get_recall_evidence",
+    "finish",
+    "abstain",
+}
 
 
 class ActorOutputError(Exception):

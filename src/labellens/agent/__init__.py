@@ -1,5 +1,5 @@
 from labellens.agent.decision import ALLOWED_ACTIONS, ActorOutputError, AgentDecision, parse_decision
-from labellens.agent.llm_client import HTTPLLMClient, LLMClient, MockLLMClient
+from labellens.agent.llm_client import DEFAULT_MODEL, LLMClient, MockLLMClient, OpenAILLMClient
 from labellens.agent.react_actor import TOOL_DESCRIPTIONS, ReActActor
 from labellens.agent.react_runtime import MAX_STEPS, ReActRuntime
 from labellens.agent.runtime import run_query
@@ -16,7 +16,8 @@ __all__ = [
     "parse_decision",
     "LLMClient",
     "MockLLMClient",
-    "HTTPLLMClient",
+    "OpenAILLMClient",
+    "DEFAULT_MODEL",
     "TOOL_DESCRIPTIONS",
     "ReActActor",
     "ReActRuntime",

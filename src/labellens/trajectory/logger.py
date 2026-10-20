@@ -17,8 +17,17 @@ class TrajectoryLogger:
     workflow, then `finalize` once a status/answer is reached, then `save`.
     """
 
-    def __init__(self, query: str, product_identifier: str) -> None:
-        self.trajectory = Trajectory(query=query, product_identifier=product_identifier)
+    def __init__(self, query: str, product_identifier: str, run_id: Optional[str] = None) -> None:
+        """`run_id` is optional so existing callers (e.g. v0's deterministic
+        runtime) keep getting an auto-generated id with no change. Pass it
+        explicitly when a canonical id already exists elsewhere (e.g.
+        ReActRuntime generates one run_id and shares it with AgentState)
+        so the two don't drift apart.
+        """
+        if run_id is not None:
+            self.trajectory = Trajectory(run_id=run_id, query=query, product_identifier=product_identifier)
+        else:
+            self.trajectory = Trajectory(query=query, product_identifier=product_identifier)
 
     def log_step(
         self,

@@ -1,4 +1,4 @@
-"""ReActRuntime: the v0.1 control loop.
+"""ReActRuntime: the v0.1/v0.2 control loop.
 
     Actor.decide() -> AgentDecision -> validate -> execute tool ->
     observation -> update state -> log -> repeat -> finish / abstain /
@@ -11,10 +11,15 @@ output is trusted without the validation in `_validate_decision` passing
 first, and no tool failure is allowed to crash the run — it becomes a
 failed observation instead, exactly like a successful one, so the Actor
 (and later a Comparator) can see it.
+
+Which evidence tool to call, in what order, and how many times is never
+decided here — that is entirely the Actor's job. This file only knows
+*that* a tool was selected, never *why*.
 """
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -23,20 +28,26 @@ from labellens.agent.react_actor import ReActActor
 from labellens.agent.state import AgentState, RunStatus
 from labellens.evidence.models import Evidence
 from labellens.tools.base import Tool, ToolResult
+from labellens.tools.certification import GetCertificationEvidenceTool
 from labellens.tools.ingredients import GetIngredientEvidenceTool
 from labellens.tools.product import IdentifyProductTool, Product
+from labellens.tools.recalls import GetRecallEvidenceTool
 from labellens.trajectory.logger import TrajectoryLogger
 from labellens.trajectory.models import Trajectory
 
 MAX_STEPS = 6
 
-# Only these two real tools are selectable in v0.1. certification/recall
-# tools exist (tools/certification.py, tools/recalls.py) but are
-# deliberately left out of this registry, so the Actor cannot select
-# behavior that isn't implemented yet.
+# Every action a tool call can resolve to shares one argument: product_id.
+# identify_product takes "query" instead (it's resolving identity, not
+# looking up evidence for an already-identified product). finish/abstain
+# are not tools and are handled separately, not via self.tools.
+_EVIDENCE_TOOL_ACTIONS = ("get_ingredient_evidence", "get_certification_evidence", "get_recall_evidence")
+
 REQUIRED_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "identify_product": ("query",),
     "get_ingredient_evidence": ("product_id",),
+    "get_certification_evidence": ("product_id",),
+    "get_recall_evidence": ("product_id",),
     "finish": ("answer",),
     "abstain": ("reason",),
 }
@@ -46,6 +57,8 @@ def default_tools() -> dict[str, Tool]:
     return {
         "identify_product": IdentifyProductTool(),
         "get_ingredient_evidence": GetIngredientEvidenceTool(),
+        "get_certification_evidence": GetCertificationEvidenceTool(),
+        "get_recall_evidence": GetRecallEvidenceTool(),
     }
 
 
@@ -63,8 +76,12 @@ class ReActRuntime:
         self.max_steps = max_steps
 
     def run(self, query: str, output_dir: Optional[Path] = None) -> tuple[AgentState, Trajectory, Path]:
-        state = AgentState(query=query, required_evidence=["ingredient_or_allergen_evidence"])
-        logger = TrajectoryLogger(query=query, product_identifier="")
+        # One canonical run_id for the whole run, shared by AgentState and
+        # Trajectory, so a run can be cross-referenced between the two
+        # instead of each generating its own unrelated id.
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        state = AgentState(run_id=run_id, query=query, required_evidence=["ingredient_or_allergen_evidence"])
+        logger = TrajectoryLogger(query=query, product_identifier="", run_id=run_id)
         logger.log_step("run_started", state_after=state.to_dict())
 
         while state.current_step < self.max_steps:
@@ -72,7 +89,9 @@ class ReActRuntime:
             state_before = state.to_dict()
 
             try:
-                decision = self.actor.decide(query=query, state=state, observations=state.observations)
+                decision = self.actor.decide(
+                    query=query, state=state, observations=state.observations, max_steps=self.max_steps
+                )
             except ActorOutputError as exc:
                 return self._terminate_on_error(state, logger, state_before, f"malformed actor decision: {exc}", output_dir)
 
@@ -105,7 +124,12 @@ class ReActRuntime:
         Shape validation (well-formed JSON object with the right keys)
         already happened in decision.parse_decision before this is ever
         called — this only checks things that depend on which tools this
-        runtime actually exposes.
+        runtime actually exposes. This also, deliberately, never checks
+        *which* tool was chosen against the question asked — that
+        judgment belongs to the Actor alone. A repeated identical call,
+        or a call made before product identity is resolved, is not
+        rejected here either; both are allowed through to tool execution
+        and simply show up in the trajectory as what they are.
         """
         if decision.action not in ALLOWED_ACTIONS:
             return f"unknown action '{decision.action}'"
@@ -124,6 +148,8 @@ class ReActRuntime:
         call_kwargs = self._map_arguments(decision.action, decision.arguments)
         state_before = state.to_dict()
 
+        is_repeat_call = decision.action in state.tools_called
+
         try:
             result = tool.execute(**call_kwargs)
         except Exception as exc:  # the tool itself broke; don't crash the run
@@ -134,12 +160,20 @@ class ReActRuntime:
 
         if decision.action == "identify_product":
             observation = self._apply_identify_product_result(state, tool.name, result)
+            if state.resolved_product is not None:
+                # Keep the saved Trajectory's product_identifier in sync
+                # with what the run actually resolved, instead of leaving
+                # it permanently blank.
+                logger.trajectory.product_identifier = state.resolved_product.product_id
         else:
-            observation, evidence_ids = self._apply_ingredient_evidence_result(state, tool.name, result)
+            observation, evidence_ids = self._apply_evidence_tool_result(state, tool.name, result)
+
+        if is_repeat_call:
+            observation["repeated_call"] = True
 
         state.observations.append(observation)
         logger.log_step(
-            f"tool_call: {tool.name}",
+            f"tool_call: {tool.name}" + (" (repeated)" if is_repeat_call else ""),
             tool_name=tool.name,
             tool_input=call_kwargs,
             tool_output=result.to_dict(),
@@ -153,7 +187,7 @@ class ReActRuntime:
         """Translate the Actor-facing argument names into each tool's real kwargs."""
         if action == "identify_product":
             return {"product_query": arguments["query"]}
-        if action == "get_ingredient_evidence":
+        if action in _EVIDENCE_TOOL_ACTIONS:
             return {"product_id": arguments["product_id"]}
         raise ValueError(f"no argument mapping defined for action '{action}'")
 
@@ -171,9 +205,17 @@ class ReActRuntime:
         }
 
     @staticmethod
-    def _apply_ingredient_evidence_result(
+    def _apply_evidence_tool_result(
         state: AgentState, tool_name: str, result: ToolResult
     ) -> tuple[dict, list[str]]:
+        """Shared result-handling for every evidence tool (ingredient/certification/recall).
+
+        All three return the same ToolResult shape (`{"evidence": [...]}`),
+        so one method covers all of them. The observation includes the
+        actual retrieved claim content (claim_type/value/status), not just
+        a bare count — without this the Actor would have no way to reason
+        about what was actually found.
+        """
         evidence_dicts = result.data.get("evidence", []) if result.success else []
         new_evidence = [Evidence.from_dict(e) for e in evidence_dicts]
         state.evidence_collected.extend(new_evidence)
@@ -182,6 +224,7 @@ class ReActRuntime:
             "tool_name": tool_name,
             "success": result.success,
             "evidence_ids": evidence_ids,
+            "evidence": [{"claim_type": e.claim_type, "value": e.value, "status": e.status} for e in new_evidence],
             "summary": f"{len(new_evidence)} evidence item(s) retrieved." if result.success else result.error,
         }
         return observation, evidence_ids
@@ -202,6 +245,7 @@ class ReActRuntime:
         self, state: AgentState, logger: TrajectoryLogger, reason: str, output_dir: Optional[Path]
     ) -> tuple[AgentState, Trajectory, Path]:
         state_before = state.to_dict()
+        state.missing_evidence.append(reason)
         state.status = RunStatus.ABSTAINED
         state.final_answer = reason
         state.final_decision_type = "abstain"
